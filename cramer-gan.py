@@ -113,6 +113,11 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='dcgan')
     parser.add_argument('--gpus', type=str, default='0')
     args = parser.parse_args()
+    try:
+        os.makedirs('logs/{}'.format(args.data))
+    except Exception:
+        print('logs/{}'.format(args.data) + 'not created')
+        pass
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpus
     data = importlib.import_module(args.data)
     model = importlib.import_module(args.data + '.' + args.model)
