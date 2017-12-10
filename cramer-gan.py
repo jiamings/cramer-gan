@@ -7,12 +7,54 @@ from scipy.misc import imsave
 from visualize import *
 
 
-class Critic(object):
-    def __init__(self, h):
-        self.h = h
+def _safer_norm(tensor, axis=None, keep_dims=False, epsilon=1e-5):
+  sq = tf.square(tensor)
+  squares = tf.reduce_sum(sq, axis=axis, keep_dims=keep_dims)
+  return tf.sqrt(squares + epsilon)
 
-    def __call__(self, x, x_):
-        return tf.norm(self.h(x) - self.h(x_), axis=1) - tf.norm(self.h(x), axis=1)
+
+def avg_distance(diff):
+  diff.shape.assert_is_compatible_with([None, None])
+  return tf.reduce_mean(_safer_norm(diff, axis=-1))
+
+
+def _gp_critic(h_interpolates,
+               h_real,
+               h_generated):
+  # The critic is:
+  #   f(h) = |h - h_generated| - |h - h_real|
+  h_interpolates.shape.assert_is_compatible_with([None, None])
+  h_interpolates.shape.assert_is_compatible_with(h_real.shape)
+  h_interpolates.shape.assert_is_compatible_with(h_generated.shape)
+  return tf.add_n([
+      _safer_norm(h_interpolates - h_generated, axis=-1, keep_dims=True),
+      -_safer_norm(h_interpolates - h_real, axis=-1, keep_dims=True),
+  ])
+
+
+def _compute_surrogate_loss(
+    d_real_to_generated1,
+    d_real_to_generated2,
+    d_generated1_to_generated2,
+    d_real_to_0,
+    d_generated1_to_0,
+    d_generated2_to_0):
+  # The surrogate loss is:
+  #   surrogate_generator_loss = (
+  #       0.5 * |h_real - h_generated1|
+  #       0.5 * |h_real - h_generated2|
+  #       - |h_real|
+  #       - |h_generated1 - h_generated2|
+  #       + 0.5 * |h_generated1|
+  #       + 0.5 * |h_generated2|)
+  return tf.add_n([
+      0.5 * d_real_to_generated1,
+      0.5 * d_real_to_generated2,
+      -d_real_to_0,
+      -d_generated1_to_generated2,
+      0.5 * d_generated1_to_0,
+      0.5 * d_generated2_to_0,
+  ])
 
 
 class CramerGAN(object):
@@ -21,7 +63,6 @@ class CramerGAN(object):
         self.data = data
         self.d_net = d_net
         self.g_net = g_net
-        self.critic = Critic(d_net)
         self.x_sampler = x_sampler
         self.z_sampler = z_sampler
         self.x_dim = d_net.x_dim
@@ -33,20 +74,52 @@ class CramerGAN(object):
         self.x1_ = self.g_net(self.z1, reuse=False)
         self.x2_ = self.g_net(self.z2)
 
-        dummy = d_net(self.x, reuse=False)
-        # self.g_loss = tf.reduce_mean(
-        #     tf.norm(d_net(self.x) - d_net(self.x1_))
-        #     + tf.norm(d_net(self.x) - d_net(self.x2_))
-        #     - tf.norm(d_net(self.x1_) - d_net(self.x2_))
-        # )
+        h_real = d_net(self.x, reuse=False)
+        h_generated1 = d_net(self.x1_)
+        h_generated2 = d_net(self.x2_)
+
+        # If having independent examples in the minibatch,
+        # it would be possible to construct `batch_size * (batch_size - 1)`
+        # independent pairs.
+        # Here, we construct just `batch_size` independent pairs
+        # to be able to use the same code for conditional modeling.
+        d_real_to_generated1 = avg_distance(h_real - h_generated1)
+        d_real_to_generated2 = avg_distance(h_real - h_generated2)
+        d_generated1_to_generated2 = avg_distance(h_generated1 - h_generated2)
+        d_real_to_0 = avg_distance(h_real)
+        d_generated1_to_0 = avg_distance(h_generated1)
+        d_generated2_to_0 = avg_distance(h_generated2)
+
+        # The energy_g_loss is the energy distance without
+        # the |h_real - h'_real| term.
+        energy_g_loss = tf.add_n([
+            d_real_to_generated1,
+            d_real_to_generated2,
+            -d_generated1_to_generated2,
+        ])
         # surrogate generator loss
-        self.g_loss = tf.reduce_mean(self.critic(self.x, self.x2_) - self.critic(self.x1_, self.x2_))
-        self.d_loss = -self.g_loss
+        surrogate_g_loss = _compute_surrogate_loss(
+            d_real_to_generated1=d_real_to_generated1,
+            d_real_to_generated2=d_real_to_generated2,
+            d_generated1_to_generated2=d_generated1_to_generated2,
+            d_real_to_0=d_real_to_0,
+            d_generated1_to_0=d_generated1_to_0,
+            d_generated2_to_0=d_generated2_to_0)
+
+        self.g_loss = energy_g_loss
+        self.d_loss = -surrogate_g_loss
 
         # interpolate real and generated samples
         epsilon = tf.random_uniform([], 0.0, 1.0)
+        # Using x and x1_ for the x_hat
+        # and using the corresponding h_real and h_generated1
+        # in the _gp_critic.
         x_hat = epsilon * self.x + (1 - epsilon) * self.x1_
-        d_hat = self.critic(x_hat, self.x2_)
+        h_interpolates = d_net(x_hat)
+        d_hat = _gp_critic(
+            h_interpolates=h_interpolates,
+            h_real=h_real,
+            h_generated=h_generated1)
 
         ddx = tf.gradients(d_hat, x_hat)[0]
         print(ddx.get_shape().as_list())
